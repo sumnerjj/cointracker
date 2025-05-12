@@ -1,0 +1,13 @@
+{% extends 'layout.html' %}
+{% block title %}Wallet {{ wallet.id }}{% endblock %}
+{% block content %}
+  <h2>{{ wallet.address }}</h2>
+  <p>Balance: {{ '%.8f'|format(wallet.balance_sat/1e8) }} BTC</p>
+  <p>Last synced: {{ wallet.last_synced_at or 'never' }}</p>
+  <h3>Transactions (latest {{ txs|length }})</h3>
+  <ul>
+    {% for t in txs %}
+      <li><code>{{ t.tx_hash }}</code></li>
+    {% endfor %}
+  </ul>
+{% endblock %}
