@@ -38,7 +38,7 @@ redis-server
 Start the Flask web server:
 
 ```bash
-FLASK_APP=cointracker_app.py flask run
+python cointracker_app.py 
 ```
 
 Start the Celery worker (in a separate terminal):

@@ -1,19 +1,3 @@
-"""CoinTracker – Flask prototype (updated)
-
-Changes in this revision
-------------------------
-* **Removed the `is_latest` flag** from `SyncRun`; “latest” is now determined by
-  `started_at` ordering, and active runs are detected via `status='in_progress'`.
-* Added helper logic to fetch the most recent or active sync without relying on
-  a dedicated column.
-* Ensured `status` is updated **exactly once** at start, completion, or error.
-* Minor UI tweaks: continues to display the latest sync’s status in both list
-  and detail views.
-
-Run instructions are unchanged. If you previously created `cointracker.db`,
-**delete it** (or run a migration) so SQLAlchemy can apply the new schema.
-"""
-
 from __future__ import annotations
 
 import os
@@ -241,13 +225,13 @@ def index() -> str:
     return redirect(url_for("list_wallets"))
 
 
-@app.route("/wallets")
+@app.route("/wallets/")
 def list_wallets():  # type: ignore[valid-type]
     wallets = Wallet.query.order_by(Wallet.created_at.desc()).all()
     return render_template("wallets.html", wallets=wallets)
 
 
-@app.route("/wallets/add", methods=["GET", "POST"])
+@app.route("/wallets/add/", methods=["GET", "POST"])
 def add_wallet():  # type: ignore[valid-type]
     if request.method == "POST":
         address = request.form.get("address", "").strip()
@@ -270,7 +254,7 @@ def add_wallet():  # type: ignore[valid-type]
     return render_template("add_wallet.html")
 
 
-@app.route("/wallets/<int:wallet_id>")
+@app.route("/wallets/<int:wallet_id>/")
 def detail_wallet(wallet_id: int):  # type: ignore[valid-type]
     wallet = Wallet.query.get_or_404(wallet_id)
     sync = (
@@ -285,6 +269,20 @@ def detail_wallet(wallet_id: int):  # type: ignore[valid-type]
         .all()
     )
     return render_template("wallet_detail.html", wallet=wallet, sync=sync, txs=txs)
+
+
+@app.route("/wallets/<int:wallet_id>/delete", methods=["POST"])
+def delete_wallet(wallet_id: int):
+    wallet = Wallet.query.get_or_404(wallet_id)
+
+    # Delete associated transactions and sync runs
+    Transaction.query.filter_by(wallet_id=wallet.id).delete()
+    SyncRun.query.filter_by(wallet_id=wallet.id).delete()
+    db.session.delete(wallet)
+    db.session.commit()
+
+    flash("Wallet and associated data deleted", "success")
+    return redirect(url_for("list_wallets"))
 
 
 @app.route("/wallets/<int:wallet_id>/resync", methods=["POST"])

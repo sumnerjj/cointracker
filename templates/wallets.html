@@ -7,5 +7,10 @@
   <td>{{ '%.8f'|format(w.balance_sat/1e8) }}</td>
   <td>{{ w.last_synced_at or '—' }}</td>
   <td>{{ w.last_sync.status if w.last_sync else '—' }}</td>
+  <td>
+  <form action="{{ url_for('delete_wallet', wallet_id=w.id) }}" method="post" style="display:inline;" onsubmit="return confirm('Delete this wallet?');">
+    <button type="submit" style="background: none; border: none; color: red;">🗑️</button>
+  </form>
+</td>
 </tr>{% endfor %}
 </table>{% endblock %}
