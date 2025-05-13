@@ -1,15 +1,11 @@
-{% extends 'layout.html' %}
-{% block title %}Wallets{% endblock %}
-{% block content %}
-  <a href={{ url_for('add_wallet') }}>&#x2795; Add wallet</a>
-  <table>
-    <tr><th>Address</th><th>Balance&nbsp;(BTC)</th><th>Last&nbsp;synced</th></tr>
-    {% for w in wallets %}
-      <tr>
-        <td><a href={{ url_for('detail_wallet', wallet_id=w.id) }}>{{ w.address }}</a></td>
-        <td>{{ '%.8f'|format(w.balance_sat/1e8) }}</td>
-        <td>{{ w.last_synced_at or '—' }}</td>
-      </tr>
-    {% endfor %}
-  </table>
-{% endblock %}
+{% extends 'layout.html' %}{% block title %}Wallets{% endblock %}{% block content %}
+<a href={{ url_for('add_wallet') }}>&#x2795; Add wallet</a>
+<table>
+<tr><th>Address</th><th>Balance&nbsp;(BTC)</th><th>Last&nbsp;synced</th><th>Status</th></tr>
+{% for w in wallets %}<tr>
+  <td><a href={{ url_for('detail_wallet', wallet_id=w.id) }}>{{ w.address }}</a></td>
+  <td>{{ '%.8f'|format(w.balance_sat/1e8) }}</td>
+  <td>{{ w.last_synced_at or '—' }}</td>
+  <td>{{ w.last_sync.status if w.last_sync else '—' }}</td>
+</tr>{% endfor %}
+</table>{% endblock %}

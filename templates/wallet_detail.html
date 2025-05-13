@@ -1,13 +1,7 @@
-{% extends 'layout.html' %}
-{% block title %}Wallet {{ wallet.id }}{% endblock %}
-{% block content %}
-  <h2>{{ wallet.address }}</h2>
-  <p>Balance: {{ '%.8f'|format(wallet.balance_sat/1e8) }} BTC</p>
-  <p>Last synced: {{ wallet.last_synced_at or 'never' }}</p>
-  <h3>Transactions (latest {{ txs|length }})</h3>
-  <ul>
-    {% for t in txs %}
-      <li><code>{{ t.tx_hash }}</code></li>
-    {% endfor %}
-  </ul>
-{% endblock %}
+{% extends 'layout.html' %}{% block title %}Wallet{% endblock %}{% block content %}
+<h2>{{ wallet.address }}</h2>
+<p>Balance: {{ '%.8f'|format(wallet.balance_sat/1e8) }} BTC</p>
+{% if sync %}<p>Last sync: {{ sync.started_at }} → {{ sync.ended_at or 'running' }} (status: {{ sync.status }})</p>
+{% if sync.status == 'in_progress' %}<div style='padding:0.5em 1em;background:#fffbe6;color:#a67c00;border-left:4px solid #ffc107;margin:1em 0;'>🔄 Sync is currently in progress.<br>Refresh the page to check progress.</div>{% endif %}{% endif %}
+<form action={{ url_for('trigger_sync', wallet_id=wallet.id) }} method=post><button type=submit>&#x21bb; Re‑sync</button></form>
+<h3>Latest {{ txs|length }} transactions</h3><ul>{% for t in txs %}<li><code>{{ t.tx_hash }}</code></li>{% endfor %}</ul>{% endblock %}

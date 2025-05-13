@@ -1,24 +1,17 @@
-"""CoinTracker Part 1 — Flask prototype
+"""CoinTracker – Flask prototype (updated)
 
-Features implemented
---------------------
-* Add Bitcoin wallet address (validates legacy / P2SH / Bech32) through a simple HTML form.
-* Persist addresses in a local SQLite DB (via SQLAlchemy).
-* Kick off a Celery background task that fetches current balance & the first page of transactions
-  from Blockchair’s public API.
-* List view of all wallets with cached balances.
-* Detail view for a single wallet with balance + (up to 100) recent transactions.
+Changes in this revision
+------------------------
+* **Removed the `is_latest` flag** from `SyncRun`; “latest” is now determined by
+  `started_at` ordering, and active runs are detected via `status='in_progress'`.
+* Added helper logic to fetch the most recent or active sync without relying on
+  a dedicated column.
+* Ensured `status` is updated **exactly once** at start, completion, or error.
+* Minor UI tweaks: continues to display the latest sync’s status in both list
+  and detail views.
 
-Prerequisites
--------------
-$ pip install flask flask_sqlalchemy celery redis requests
-# Make sure redis‑server is running locally.
-
-Running
--------
-$ export FLASK_APP=cointracker_app.py
-$ flask run               # starts the web server on http://127.0.0.1:5000
-$ celery -A cointracker_app.celery worker -l info  # in another terminal
+Run instructions are unchanged. If you previously created `cointracker.db`,
+**delete it** (or run a migration) so SQLAlchemy can apply the new schema.
 """
 
 from __future__ import annotations
@@ -36,7 +29,6 @@ from flask import (
     flash,
     redirect,
     render_template,
-    render_template_string,
     request,
     url_for,
 )
@@ -50,23 +42,6 @@ from celery import Celery
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 DATABASE_PATH = BASE_DIR / "cointracker.db"
-
-
-def _ensure_template_files() -> None:  # noqa: C901 – long but simple
-    templates: dict[str, str] = {
-        "layout.html": """<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>{% block title %}{% endblock %} – CoinTracker</title>\n  <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/water.css@2/out/water.css\">\n</head>\n<body>\n<header><h1><a href={{ url_for('list_wallets') }}>CoinTracker</a></h1></header>\n{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<ul class=flashes>{% for c,m in messages %}<li class={{c}}>{{m}}</li>{% endfor %}</ul>{% endif %}{% endwith %}\n{% block content %}{% endblock %}\n</body>\n</html>\n""",
-        "wallets.html": """{% extends 'layout.html' %}{% block title %}Wallets{% endblock %}{% block content %}\n<a href={{ url_for('add_wallet') }}>&#x2795; Add wallet</a>\n<table>\n<tr><th>Address</th><th>Balance (BTC)</th><th>Last synced</th><th>Status</th></tr>\n{% for w in wallets %}<tr>\n<td><a href={{ url_for('detail_wallet', wallet_id=w.id) }}>{{ w.address }}</a></td>\n<td>{{ '%.8f'|format(w.balance_sat/1e8) }}</td>\n<td>{{ w.last_synced_at or '—' }}</td>\n<td>{{ w.last_sync.status if w.last_sync else '—' }}</td>\n</tr>{% endfor %}\n</table>{% endblock %}\n""",
-        "add_wallet.html": """{% extends 'layout.html' %}{% block title %}Add wallet{% endblock %}{% block content %}\n<h2>Add Bitcoin wallet</h2>\n<form method=post><label for=address>Address</label><input name=address id=address size=60 required autofocus><button type=submit>Add</button></form>{% endblock %}\n""",
-        "wallet_detail.html": """{% extends 'layout.html' %}{% block title %}Wallet{% endblock %}{% block content %}\n<h2>{{ wallet.address }}</h2>\n<p>Balance: {{ '%.8f'|format(wallet.balance_sat/1e8) }} BTC</p>\n{% if sync %}<p>Last sync: {{ sync.started_at }} → {{ sync.ended_at or 'running' }} (status: {{ sync.status }})</p>\n{% if sync.status == 'in_progress' %}<div style='padding: 0.5em 1em; background: #fffbe6; color: #a67c00; border-left: 4px solid #ffc107; margin: 1em 0;'>🔄 Sync is currently in progress.<br>This may take several minutes for large wallets. Refresh the page to check progress.</div>{% endif %}{% endif %}\n<form action={{ url_for('trigger_sync', wallet_id=wallet.id) }} method=post><button type=submit>&#x21bb; Re‑sync</button></form>\n<h3>Latest {{ txs|length }} transactions</h3><ul>{% for t in txs %}<li><code>{{ t.tx_hash }}</code></li>{% endfor %}</ul>{% endblock %}\n""",
-    }
-    TEMPLATES_DIR.mkdir(exist_ok=True)
-    for name, content in templates.items():
-        fp = TEMPLATES_DIR / name
-        if not fp.exists():
-            fp.write_text(content, encoding="utf-8")
-
-
-_ensure_template_files()
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +66,15 @@ class Wallet(db.Model):
     balance_sat = db.Column(db.BigInteger, default=0)
     last_synced_at = db.Column(db.DateTime)
 
+    @property
+    def last_sync(self):  # noqa: D401 – simple property
+        """Return the most recent SyncRun (or *None*)."""
+        return (
+            SyncRun.query.filter_by(wallet_id=self.id)
+            .order_by(SyncRun.started_at.desc())
+            .first()
+        )
+
 
 class Transaction(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -106,7 +90,7 @@ class Transaction(db.Model):
 
 
 class SyncRun(db.Model):
-    """Tracks a single end‑to‑end sync of one wallet."""
+    """Tracks one end‑to‑end sync for a wallet."""
 
     id = db.Column(db.Integer, primary_key=True)
     wallet_id = db.Column(db.Integer, db.ForeignKey("wallet.id"), nullable=False)
@@ -115,7 +99,6 @@ class SyncRun(db.Model):
     status = db.Column(db.String(16), default="in_progress")  # in_progress/completed/error
     current_offset = db.Column(db.Integer, default=0)
     error_message = db.Column(db.String(255))
-    is_latest = db.Column(db.Boolean, default=True)  # Only one TRUE per wallet
 
     wallet = db.relationship("Wallet", backref=db.backref("sync_runs", lazy=True))
 
@@ -150,21 +133,19 @@ celery: Celery = make_celery(app)
 # Bitcoin address validation helpers
 # ---------------------------------------------------------------------------
 
-# Very lightweight regex for common cases:
 ADDRESS_REGEX = re.compile(r"^(bc1[0-9a-z]{25,39}|[13][a-km-zA-HJ-NP-Z0-9]{25,34})$")
 
 def is_valid_address(addr: str) -> bool:
-    """Return True if *addr* looks like a Bitcoin main‑net address."""
     return bool(ADDRESS_REGEX.fullmatch(addr))
 
 # ---------------------------------------------------------------------------
-# Celery task: initial sync (balance + first 100 tx hashes for demo)
+# Celery task: sync wallet end‑to‑end (pagination)
 # ---------------------------------------------------------------------------
 
 BLOCKCHAIR_API_URL = "https://api.blockchair.com/bitcoin/dashboards/address/{address}"
 PAGE_SIZE = 100
 MAX_RETRIES = 5
-RATE_LIMIT_SLEEP = 1.0  # seconds after 429
+RATE_LIMIT_SLEEP = 1.0  # seconds to wait after 429
 
 
 def _request_with_retry(url: str, params: dict) -> dict:
@@ -172,101 +153,83 @@ def _request_with_retry(url: str, params: dict) -> dict:
     while attempt < MAX_RETRIES:
         try:
             resp = requests.get(url, params=params, timeout=20)
-            if resp.status_code == 429:  # rate limit
-                sleep_for = int(resp.headers.get("Retry-After", RATE_LIMIT_SLEEP))
-                time.sleep(sleep_for)
+            if resp.status_code == 429:
+                time.sleep(int(resp.headers.get("Retry-After", RATE_LIMIT_SLEEP)))
                 attempt += 1
                 continue
             resp.raise_for_status()
             return resp.json()
-        except requests.RequestException as exc:  # network / server errors
+        except requests.RequestException:
             attempt += 1
-            backoff = 2**attempt
-            time.sleep(backoff)
-            if attempt >= MAX_RETRIES:
-                raise exc
-    raise RuntimeError("unreachable retry loop")
+            time.sleep(2 ** attempt)
+    raise RuntimeError("Blockchair request failed after retries")
 
 
 @celery.task(name="sync_wallet")
-def sync_wallet(wallet_id: int) -> None:  # noqa: C901 – functionally long
+def sync_wallet(wallet_id: int) -> None:  # noqa: C901 – long but straightforward
     wallet = Wallet.query.get(wallet_id)
     if not wallet:
         return
 
-    app.logger.info(f"Starting sync for wallet {wallet.address} (id={wallet.id})")
-
-    current_sync: SyncRun | None = (
-        SyncRun.query.filter_by(wallet_id=wallet.id, is_latest=True).first()
+    # Resume if an in‑progress run exists; else start a new one
+    current_sync = (
+        SyncRun.query.filter_by(wallet_id=wallet.id)
+        .order_by(SyncRun.started_at.desc())
+        .first()
     )
+
     if current_sync and current_sync.status == "in_progress":
         sync_run = current_sync
-        app.logger.info(f"Resuming existing sync at offset {sync_run.current_offset}")
     else:
-        if current_sync:
-            current_sync.is_latest = False
-            db.session.add(current_sync)
-        sync_run = SyncRun(wallet_id=wallet.id, current_offset=0)
+        sync_run = SyncRun(wallet_id=wallet.id)
         db.session.add(sync_run)
         db.session.commit()
-        app.logger.info("Created new sync run")
 
     offset = sync_run.current_offset or 0
     more_data = True
 
     try:
         while more_data:
-            app.logger.info(f"Fetching transactions from offset {offset}")
             params = {"limit": PAGE_SIZE, "offset": offset}
-            data = _request_with_retry(
-                BLOCKCHAIR_API_URL.format(address=wallet.address), params
-            )
+            app.logger.info(f"Fetching transactions from offset {offset}")
+            data = _request_with_retry(BLOCKCHAIR_API_URL.format(address=wallet.address), params)
             entry = data.get("data", {}).get(wallet.address, {})
-            address_meta = entry.get("address", {})
+            addr_meta = entry.get("address", {})
 
-            wallet.balance_sat = address_meta.get("balance", wallet.balance_sat)
+            # Update balance
+            wallet.balance_sat = addr_meta.get("balance", wallet.balance_sat)
+            wallet.last_synced_at = datetime.utcnow()
             db.session.add(wallet)
 
-            tx_hashes: list[str] = entry.get("transactions", [])
-            app.logger.info(f"Retrieved {len(tx_hashes)} transactions")
-            if not tx_hashes:
-                more_data = False
+            hashes = entry.get("transactions", [])
+            if not hashes:
                 break
 
-            inserted = 0
-            for txh in tx_hashes:
+            for txh in hashes:
                 if not Transaction.query.filter_by(wallet_id=wallet.id, tx_hash=txh).first():
                     db.session.add(Transaction(wallet_id=wallet.id, tx_hash=txh))
-                    inserted += 1
-
-            app.logger.info(f"Inserted {inserted} new transactions")
 
             offset += PAGE_SIZE
             sync_run.current_offset = offset
             db.session.add(sync_run)
             db.session.commit()
 
-            if len(tx_hashes) < PAGE_SIZE:
+            if len(hashes) < PAGE_SIZE:
                 more_data = False
 
         sync_run.status = "completed"
-        wallet.last_synced_at = datetime.utcnow()
         sync_run.ended_at = datetime.utcnow()
         db.session.add(sync_run)
         db.session.commit()
-        app.logger.info(f"Sync completed for wallet {wallet.address}")
 
     except Exception as exc:  # noqa: BLE001
-        app.logger.exception("Sync failed for wallet %s", wallet.address)
         db.session.rollback()
         sync_run.status = "error"
         sync_run.error_message = str(exc)[:250]
         sync_run.ended_at = datetime.utcnow()
         db.session.add(sync_run)
         db.session.commit()
-        app.logger.error(f"Sync failed: {exc}")
         raise
-
 
 
 # ---------------------------------------------------------------------------
@@ -274,18 +237,18 @@ def sync_wallet(wallet_id: int) -> None:  # noqa: C901 – functionally long
 # ---------------------------------------------------------------------------
 
 @app.route("/")
-def index():
+def index() -> str:
     return redirect(url_for("list_wallets"))
 
 
 @app.route("/wallets")
-def list_wallets():
+def list_wallets():  # type: ignore[valid-type]
     wallets = Wallet.query.order_by(Wallet.created_at.desc()).all()
     return render_template("wallets.html", wallets=wallets)
 
 
 @app.route("/wallets/add", methods=["GET", "POST"])
-def add_wallet():
+def add_wallet():  # type: ignore[valid-type]
     if request.method == "POST":
         address = request.form.get("address", "").strip()
         if not is_valid_address(address):
@@ -300,10 +263,7 @@ def add_wallet():
         wallet = Wallet(address=address)
         db.session.add(wallet)
         db.session.commit()
-
-        # Kick off background sync
         sync_wallet.delay(wallet.id)
-
         flash("Wallet added – initial sync scheduled", "success")
         return redirect(url_for("detail_wallet", wallet_id=wallet.id))
 
@@ -311,9 +271,13 @@ def add_wallet():
 
 
 @app.route("/wallets/<int:wallet_id>")
-def detail_wallet(wallet_id: int):
+def detail_wallet(wallet_id: int):  # type: ignore[valid-type]
     wallet = Wallet.query.get_or_404(wallet_id)
-    sync = SyncRun.query.filter_by(wallet_id=wallet.id, is_latest=True).first()
+    sync = (
+        SyncRun.query.filter_by(wallet_id=wallet.id)
+        .order_by(SyncRun.started_at.desc())
+        .first()
+    )
     txs = (
         Transaction.query.filter_by(wallet_id=wallet.id)
         .order_by(Transaction.id.desc())
@@ -321,6 +285,13 @@ def detail_wallet(wallet_id: int):
         .all()
     )
     return render_template("wallet_detail.html", wallet=wallet, sync=sync, txs=txs)
+
+
+@app.route("/wallets/<int:wallet_id>/resync", methods=["POST"])
+def trigger_sync(wallet_id: int):  # type: ignore[valid-type]
+    sync_wallet.delay(wallet_id)
+    flash("Re‑sync triggered", "success")
+    return redirect(url_for("detail_wallet", wallet_id=wallet_id))
 
 
 # ---------------------------------------------------------------------------
